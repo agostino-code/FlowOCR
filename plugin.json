@@ -4,7 +4,7 @@
     "Name": "FlowOCR",
     "Description": "GLM-OCR plugin: code, math & text from any screen region",
     "Author": "Agostino Cesarano",
-    "Version": "1.0.0",
+    "Version": "1.0.1",
     "Language": "python",
     "Website": "https://github.com/agostino-code/FlowOCR.git",
     "IcoPath": "Images\\app.png",
