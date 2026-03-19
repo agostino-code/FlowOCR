@@ -1,0 +1,26 @@
+#$schema: https://www.flowlauncher.com/schemas/settings-template.schema.json
+
+body:
+  - type: dropdown
+    attributes:
+      name: backend
+      label: OCR Backend
+      description: Choose the OCR engine to use.
+      defaultValue: ollama
+      options:
+        - ollama
+        - huggingface
+
+  - type: textBox
+    attributes:
+      name: ollama_entrypoint
+      label: Ollama Entrypoint
+      description: Base URL of the local Ollama server (e.g. http://localhost:11434).
+      defaultValue: "http://localhost:11434"
+
+  - type: passwordBox
+    attributes:
+      name: hf_api_key
+      label: Hugging Face API Key
+      description: Your HF token (hf_...). Required only when backend is set to huggingface.
+      defaultValue: ""

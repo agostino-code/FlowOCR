@@ -1,0 +1,12 @@
+{
+    "ID": "2311aa53-892e-4008-9aa1-fecea00c251c",
+    "ActionKeyword": "ocr",
+    "Name": "FlowOCR",
+    "Description": "GLM-OCR plugin: code, math & text from any screen region",
+    "Author": "Agostino Cesarano",
+    "Version": "1.0.0",
+    "Language": "python",
+    "Website": "https://github.com/agostino-code/FlowOCR.git",
+    "IcoPath": "Images\\app.png",
+    "ExecuteFileName": "main.py"
+}
