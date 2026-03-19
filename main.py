@@ -16,13 +16,14 @@ import ctypes
 import datetime
 import json
 import logging
-import mimetypes
+import http.client
 import os
 import subprocess
 import sys
 import tempfile
 import time
 from ctypes import wintypes
+from urllib.parse import urlsplit
 
 # ---------------------------------------------------------------------------
 # Plugin path setup – must happen before pyflowlauncher import
@@ -63,7 +64,7 @@ OLLAMA_OCR_PROMPT  = "Text Recognition:"
 
 # HuggingFace: serverless inference router
 HF_ROUTER_URL = "https://router.huggingface.co/zai-org/api/paas/v4/layout_parsing"
-OCR_MODEL_HF  = "zai-org/GLM-OCR"
+OCR_MODEL_HF  = "glm-ocr"
 
 # subprocess flags: no console window; fully detached for the worker process
 _CREATE_NO_WINDOW      = 0x08000000
@@ -86,6 +87,91 @@ def _try_remove(path):
         os.remove(path)
     except OSError:
         pass
+
+
+def _http_post_bytes(url, headers, data, timeout):
+    """
+    POST raw bytes and return (status_code, text_body, json_payload_or_none).
+
+    Uses the low-level putrequest/putheader/endheaders API instead of
+    conn.request() to prevent http.client from silently appending
+    ';charset=UTF-8' to the Content-Type header — which would turn
+    'image/jpeg' into 'image/jpeg;charset=UTF-8' and cause the HF router
+    to reject the request with a 'Content type not supported' error.
+    """
+    parts = urlsplit(url)
+    scheme = (parts.scheme or "").lower()
+    host = parts.hostname
+    if not host:
+        raise ConnectionError(f"Invalid URL: {url}")
+
+    path = parts.path or "/"
+    if parts.query:
+        path = f"{path}?{parts.query}"
+
+    if scheme == "https":
+        conn = http.client.HTTPSConnection(host, parts.port or 443, timeout=timeout)
+    elif scheme == "http":
+        conn = http.client.HTTPConnection(host, parts.port or 80, timeout=timeout)
+    else:
+        raise ConnectionError(f"Unsupported URL scheme: {parts.scheme!r}")
+
+    try:
+        # Build the request manually so no automatic header injection occurs
+        conn.putrequest("POST", path, skip_accept_encoding=True)
+        conn.putheader("Host", host)
+        conn.putheader("Content-Length", str(len(data)))
+        for name, value in (headers or {}).items():
+            conn.putheader(name, value)
+        conn.endheaders()
+        conn.send(data)
+
+        resp = conn.getresponse()
+        status = resp.status
+        raw = resp.read() or b""
+    except OSError as exc:
+        raise ConnectionError(str(exc)) from exc
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    body = raw.decode("utf-8", errors="replace")
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        payload = None
+    return status, body, payload
+
+
+def _http_post_json(url, headers, payload, timeout):
+    """POST a JSON payload and return (status_code, text_body, json_payload_or_none)."""
+    final_headers = {"Content-Type": "application/json", **(headers or {})}
+    data = json.dumps(payload).encode("utf-8")
+    return _http_post_bytes(url, final_headers, data, timeout)
+
+
+def _http_post_multipart(url, headers, field_name, file_name, file_bytes, file_mime, timeout):
+    """POST multipart/form-data with one file field and return HTTP tuple."""
+    boundary = "----FlowOCRBoundary" + os.urandom(12).hex()
+    boundary_bytes = boundary.encode("ascii")
+
+    body = bytearray()
+    body.extend(b"--" + boundary_bytes + b"\r\n")
+    disposition = (
+        f'Content-Disposition: form-data; name="{field_name}"; filename="{file_name}"\r\n'
+    )
+    body.extend(disposition.encode("utf-8"))
+    body.extend(f"Content-Type: {file_mime}\r\n\r\n".encode("ascii"))
+    body.extend(file_bytes)
+    body.extend(b"\r\n--" + boundary_bytes + b"--\r\n")
+
+    final_headers = {
+        **(headers or {}),
+        "Content-Type": f"multipart/form-data; boundary={boundary}",
+    }
+    return _http_post_bytes(url, final_headers, bytes(body), timeout)
 
 # ---------------------------------------------------------------------------
 # PowerShell helpers
@@ -350,19 +436,41 @@ def _hf_error_message(payload, body=""):
 
 def _hf_extract_text(payload):
     """
-    Recursively extract OCR text from the HF router JSON response.
-    Handles multiple response shapes: plain string, list of blocks,
-    dict with common text keys, and OpenAI-style choices[].
+    Extract OCR text from the GLM-OCR layout_parsing response.
+
+    Primary format returned by the API:
+        {
+          "layout_details": [          # one entry per page
+            [                          # one entry per detected block
+              {"bbox_2d": [...], "content": "<markdown text>"},
+              ...
+            ]
+          ]
+        }
+
+    All block content strings are joined in document order with a blank line
+    between blocks. Falls back to a generic scan for other response shapes.
     """
     if isinstance(payload, str):
         return payload.strip()
 
-    if isinstance(payload, list):
-        parts = [_hf_extract_text(item) for item in payload]
-        return "\n".join(p for p in parts if p).strip()
-
     if isinstance(payload, dict):
-        # Try common direct text keys first
+        # Primary: GLM-OCR layout_details[[{content}]]
+        layout_details = payload.get("layout_details")
+        if isinstance(layout_details, list):
+            parts = []
+            for page in layout_details:
+                if not isinstance(page, list):
+                    continue
+                for block in page:
+                    if isinstance(block, dict):
+                        text = (block.get("content") or "").strip()
+                        if text:
+                            parts.append(text)
+            if parts:
+                return "\n\n".join(parts)
+
+        # Fallback: common direct text keys
         for key in ("text", "markdown", "output", "output_text", "content", "result"):
             value = payload.get(key)
             if isinstance(value, str) and value.strip():
@@ -372,91 +480,77 @@ def _hf_extract_text(payload):
                 if nested:
                     return nested
 
-        # OpenAI-style: {"choices": [{"message": {"content": "..."}}]}
+        # Fallback: OpenAI-style choices[]
         choices = payload.get("choices")
         if isinstance(choices, list) and choices:
             msg = choices[0].get("message") if isinstance(choices[0], dict) else None
             if isinstance(msg, dict):
-                content = msg.get("content")
-                if isinstance(content, str) and content.strip():
-                    return content.strip()
+                text = (msg.get("content") or "").strip()
+                if text:
+                    return text
+
+    if isinstance(payload, list):
+        parts = [_hf_extract_text(item) for item in payload]
+        return "\n".join(p for p in parts if p).strip()
 
     return ""
 
 
 def _ocr_huggingface(image_path, api_key):
     """
-    Run OCR via the HuggingFace serverless inference router.
+    Run OCR via the HuggingFace serverless inference router (GLM-OCR / MaaS).
 
-    Strategy:
-      1. Try multipart/form-data with field names 'image' then 'file'
-         (some router versions require a specific field name).
-      2. Fall back to raw bytes with several Content-Type values.
-         The router returns HTTP 200 even for errors, so we check the
-         JSON body for an 'error' field rather than relying on status code.
+    The router's upstream API requires the image as a JSON body with a
+    'file' field containing a data URI:
+
+        POST /zai-org/api/paas/v4/layout_parsing
+        Authorization: Bearer <token>
+        Content-Type: application/json
+
+        {"file": "data:image/png;base64,<b64>", "model": "glm-ocr"}
+
+    Despite the advertised curl example using raw bytes + Content-Type: image/jpeg,
+    the CloudFront/nginx proxy in front of the inference backend appends
+    ';charset=UTF-8' to any bare Content-Type, turning 'image/jpeg' into
+    'image/jpeg;charset=UTF-8', which the backend then rejects (HTTP 200 + error body).
+    Sending the image as a data URI inside a JSON payload bypasses this entirely.
     """
-    import httpx
-
     log.debug("HF OCR: router=%s model=%s image=%s token=%s...",
               HF_ROUTER_URL, OCR_MODEL_HF, image_path, api_key[:6] if api_key else "")
 
     with open(image_path, "rb") as fh:
-        image_bytes = fh.read()
+        raw_bytes = fh.read()
 
-    # Build a deduplicated MIME candidate list for the raw-bytes fallback
-    guessed, _ = mimetypes.guess_type(image_path)
-    mime_candidates = list(dict.fromkeys(
-        m for m in ("image/png", guessed, "image/jpeg", "application/octet-stream") if m
-    ))
+    # Encode as a data URI – the MaaS API accepts data:<mime>;base64,<data>
+    b64 = base64.b64encode(raw_bytes).decode("ascii")
+    data_uri = f"data:image/png;base64,{b64}"
 
-    auth_header = {"Authorization": f"Bearer {api_key}"}
-    status_code, body, payload = 0, "", None
+    payload = {"file": data_uri, "model": OCR_MODEL_HF}
+    headers = {"Authorization": f"Bearer {api_key}"}
 
-    def _parse(resp):
-        nonlocal status_code, body, payload
-        status_code = resp.status_code
-        body = resp.text or ""
-        try:
-            payload = resp.json()
-        except ValueError:
-            payload = None
+    log.debug("HF POST JSON: image %d bytes as data URI", len(raw_bytes))
+    status_code, body, resp_payload = _http_post_json(
+        HF_ROUTER_URL,
+        headers=headers,
+        payload=payload,
+        timeout=90.0,
+    )
+    log.debug("HF response: HTTP %s, body=%s", status_code, body[:200])
 
-    # 1) Multipart form-data
-    for field_name in ("image", "file"):
-        files = {field_name: (os.path.basename(image_path) or "capture.png",
-                              image_bytes, "image/png")}
-        _parse(httpx.post(HF_ROUTER_URL, headers=auth_header, files=files, timeout=90.0))
-        if status_code < 400 and not _hf_has_error(payload):
-            break
-        log.warning("HF multipart field '%s' failed (HTTP %s)", field_name, status_code)
-
-    # 2) Raw bytes fallback, only if still failing
-    if status_code >= 400 or _hf_has_error(payload):
-        for content_type in mime_candidates:
-            headers = {**auth_header, "Content-Type": content_type}
-            _parse(httpx.post(HF_ROUTER_URL, headers=headers, content=image_bytes, timeout=90.0))
-            if "content type" in body.lower() and "not supported" in body.lower():
-                log.warning("HF router rejects Content-Type '%s', trying next", content_type)
-                continue
-            if status_code < 400 and not _hf_has_error(payload):
-                break
-
-    # Final error handling
     if status_code == 401:
         raise RuntimeError(
             "HuggingFace authentication failed (401). "
             "Check hf_api_key / HF_TOKEN and token permissions."
         )
-    if status_code >= 400 or _hf_has_error(payload):
-        raise RuntimeError(f"HF router error: {_hf_error_message(payload, body)}")
+    if status_code >= 400 or _hf_has_error(resp_payload):
+        raise RuntimeError(f"HF router error: {_hf_error_message(resp_payload, body)}")
 
-    text = _hf_extract_text(payload if payload is not None else body)
+    text = _hf_extract_text(resp_payload if resp_payload is not None else body)
     if text:
         return text
     raise RuntimeError(
         f"Empty or unrecognised OCR response from HF router: {body.strip()[:220]}"
     )
-
 # ---------------------------------------------------------------------------
 # OCR backend – Ollama (local)
 # ---------------------------------------------------------------------------
@@ -469,8 +563,6 @@ def _ocr_ollama(image_path, base_url=None):
     image files as arguments in a non-TTY subprocess. The REST API is the
     correct programmatic interface.
     """
-    import httpx
-
     ollama_url = (base_url or OLLAMA_DEFAULT_URL or "").strip() or OLLAMA_DEFAULT_URL
 
     log.debug("Ollama OCR: url=%s model=%s image=%s",
@@ -487,20 +579,28 @@ def _ocr_ollama(image_path, base_url=None):
     }
 
     try:
-        response = httpx.post(url, json=body, timeout=120.0)
-    except httpx.ConnectError:
+        status_code, response_text, data = _http_post_json(
+            url,
+            headers={},
+            payload=body,
+            timeout=120.0,
+        )
+    except ConnectionError:
         raise RuntimeError(
             f"Cannot connect to Ollama at {ollama_url}. "
             "Make sure the Ollama service is running."
         )
 
-    log.debug("Ollama HTTP %s", response.status_code)
-    if response.status_code != 200:
+    log.debug("Ollama HTTP %s", status_code)
+    if status_code != 200:
         raise RuntimeError(
-            f"Ollama returned HTTP {response.status_code}: {response.text.strip()[:220]}"
+            f"Ollama returned HTTP {status_code}: {response_text.strip()[:220]}"
         )
 
-    data = response.json()
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            f"Invalid JSON from Ollama: {response_text.strip()[:220]}"
+        )
     # Response shape: {"message": {"role": "assistant", "content": "..."}}
     # Fallback to "response" key used by older Ollama versions.
     content = data.get("message", {}).get("content") or data.get("response") or ""
