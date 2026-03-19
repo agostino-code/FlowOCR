@@ -14,14 +14,16 @@ Architecture:
 import base64
 import ctypes
 import datetime
+import hashlib
+import http.client
 import json
 import logging
-import http.client
 import os
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 from ctypes import wintypes
 from urllib.parse import urlsplit
 
@@ -76,6 +78,29 @@ _DETACHED_CREATE_FLAGS = (
 
 if os.name != "nt":
     raise RuntimeError("This plugin requires Windows.")
+
+# Lock file – prevents concurrent OCR workers from stepping on each other
+_LOCK_PATH = os.path.join(tempfile.gettempdir(), "screen-ocr-worker.lock")
+
+# Tracks the SHA-256 of the last processed image to skip duplicates
+_LAST_IMAGE_HASH_PATH = os.path.join(tempfile.gettempdir(), "screen-ocr-last-hash.txt")
+
+# ---------------------------------------------------------------------------
+# Startup: purge log files older than 2 days to avoid accumulation
+# ---------------------------------------------------------------------------
+def _purge_old_logs():
+    tmp = tempfile.gettempdir()
+    cutoff = time.time() - 2 * 86400
+    for name in os.listdir(tmp):
+        if name.endswith(".log") and name[:8].isdigit():
+            path = os.path.join(tmp, name)
+            try:
+                if os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+            except OSError:
+                pass
+
+_purge_old_logs()
 
 # ---------------------------------------------------------------------------
 # Utility
@@ -207,48 +232,123 @@ def _ps_quote(value):
     return str(value).replace("'", "''")
 
 # ---------------------------------------------------------------------------
-# Windows notifications
+# Windows notifications – pure ctypes, no PowerShell round-trip
 # ---------------------------------------------------------------------------
+
+# ctypes structures for Shell_NotifyIconW
+_NIIF_INFO    = 0x00000001
+_NIIF_WARNING = 0x00000002
+_NIIF_ERROR   = 0x00000003
+_NIF_MESSAGE  = 0x00000001
+_NIF_ICON     = 0x00000002
+_NIF_TIP      = 0x00000004
+_NIF_INFO     = 0x00000010
+_NIM_ADD      = 0x00000000
+_NIM_MODIFY   = 0x00000001
+_NIM_DELETE   = 0x00000002
+_WM_USER      = 0x0400
+
+class _NOTIFYICONDATAW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize",           wintypes.DWORD),
+        ("hWnd",             wintypes.HWND),
+        ("uID",              wintypes.UINT),
+        ("uFlags",           wintypes.UINT),
+        ("uCallbackMessage", wintypes.UINT),
+        ("hIcon",            wintypes.HICON),
+        ("szTip",            wintypes.WCHAR * 128),
+        ("dwState",          wintypes.DWORD),
+        ("dwStateMask",      wintypes.DWORD),
+        ("szInfo",           wintypes.WCHAR * 256),
+        ("uVersion",         wintypes.UINT),
+        ("szInfoTitle",      wintypes.WCHAR * 64),
+        ("dwInfoFlags",      wintypes.DWORD),
+    ]
 
 def _notify(title, message, level="info"):
-    """
-    Show a Windows balloon notification, falling back to a MessageBox.
-    level: 'info' | 'warning' | 'error'
-    """
-    log.info("Notify [%s] %s - %s", level, title, message)
-    icon = {"error": "Error", "warning": "Warning"}.get(level, "Info")
+    """Show a Windows tray balloon notification using Shell_NotifyIconW (no PowerShell)."""
+    log.info("Notify [%s] %s – %s", level, title, message)
 
-    t, m, i = _ps_quote(title), _ps_quote(message), _ps_quote(icon)
+    niif = {
+        "error":   _NIIF_ERROR,
+        "warning": _NIIF_WARNING,
+    }.get(level, _NIIF_INFO)
 
-    # Try balloon tip first (non-blocking, nicer UX)
-    balloon = _run_powershell(
-        "Add-Type -AssemblyName System.Windows.Forms;"
-        "Add-Type -AssemblyName System.Drawing;"
-        "$n = New-Object System.Windows.Forms.NotifyIcon;"
-        f"$n.Icon = [System.Drawing.SystemIcons]::{i};"
-        "$n.Visible = $true;"
-        f"$n.BalloonTipTitle = '{t}';"
-        f"$n.BalloonTipText  = '{m}';"
-        "$n.ShowBalloonTip(4500);"
-        "Start-Sleep -Milliseconds 5000;"
-        "$n.Dispose();",
-        timeout=8,
-    )
-    if balloon is not None and balloon.returncode == 0:
-        return
+    # Load a stock icon matching the level
+    _IDI = {"error": 32513, "warning": 32515}.get(level, 32516)  # IDI_ERROR/WARNING/INFO
+    shell32  = ctypes.windll.shell32
+    user32   = ctypes.windll.user32
+    hIcon = user32.LoadIconW(None, ctypes.c_int(_IDI))
 
-    # Fallback: modal MessageBox
-    _run_powershell(
-        "Add-Type -AssemblyName System.Windows.Forms;"
-        f"$icon    = [System.Windows.Forms.MessageBoxIcon]::{i};"
-        "$buttons = [System.Windows.Forms.MessageBoxButtons]::OK;"
-        f"[void][System.Windows.Forms.MessageBox]::Show('{m}', '{t}', $buttons, $icon);",
-        timeout=10,
-    )
+    nid = _NOTIFYICONDATAW()
+    nid.cbSize      = ctypes.sizeof(_NOTIFYICONDATAW)
+    nid.hWnd        = user32.GetDesktopWindow()
+    nid.uID         = 0xF10C  # arbitrary unique ID for this plugin
+    nid.uFlags      = _NIF_ICON | _NIF_TIP | _NIF_INFO
+    nid.hIcon       = hIcon
+    nid.szTip       = "Screen OCR"[:127]
+    nid.szInfoTitle = title[:63]
+    nid.szInfo      = message[:255]
+    nid.dwInfoFlags = niif
+
+    shell32.Shell_NotifyIconW(_NIM_ADD,    ctypes.byref(nid))
+    time.sleep(4)
+    shell32.Shell_NotifyIconW(_NIM_DELETE, ctypes.byref(nid))
+
 
 # ---------------------------------------------------------------------------
-# Clipboard read/write
+# Clipboard – ctypes declarations at module level (avoids re-declaring per call)
 # ---------------------------------------------------------------------------
+_user32   = ctypes.WinDLL("user32",   use_last_error=True)
+_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+_CF_UNICODETEXT = 13
+_GHND           = 0x0042
+
+_user32.OpenClipboard.argtypes    = [wintypes.HWND]
+_user32.OpenClipboard.restype     = wintypes.BOOL
+_user32.EmptyClipboard.argtypes   = []
+_user32.EmptyClipboard.restype    = wintypes.BOOL
+_user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+_user32.SetClipboardData.restype  = wintypes.HANDLE
+_user32.CloseClipboard.argtypes   = []
+_user32.CloseClipboard.restype    = wintypes.BOOL
+_kernel32.GlobalAlloc.argtypes    = [wintypes.UINT, ctypes.c_size_t]
+_kernel32.GlobalAlloc.restype     = wintypes.HGLOBAL
+_kernel32.GlobalLock.argtypes     = [wintypes.HGLOBAL]
+_kernel32.GlobalLock.restype      = wintypes.LPVOID
+_kernel32.GlobalUnlock.argtypes   = [wintypes.HGLOBAL]
+_kernel32.GlobalUnlock.restype    = wintypes.BOOL
+_kernel32.GlobalFree.argtypes     = [wintypes.HGLOBAL]
+_kernel32.GlobalFree.restype      = wintypes.HGLOBAL
+
+
+def _image_hash(path):
+    """Return a short SHA-256 hex digest of a file's contents."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _is_duplicate_image(path):
+    """Return True if this image was already processed in the last run."""
+    current = _image_hash(path)
+    try:
+        with open(_LAST_IMAGE_HASH_PATH) as f:
+            if f.read().strip() == current:
+                return True
+    except OSError:
+        pass
+    try:
+        with open(_LAST_IMAGE_HASH_PATH, "w") as f:
+            f.write(current)
+    except OSError:
+        pass
+    return False
+
+
 
 def _clear_clipboard():
     """Clear the Windows clipboard (removes any existing image before snipping)."""
@@ -320,61 +420,34 @@ def _clipboard_image_to_temp_png():
 
 
 def _copy_text_to_clipboard(text):
-    """
-    Write Unicode text to the Windows clipboard using Win32 APIs directly.
-    Using ctypes avoids a PowerShell round-trip and handles arbitrary text safely.
-    """
-    user32   = ctypes.WinDLL("user32",   use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-
-    CF_UNICODETEXT = 13
-    GHND           = 0x0042
-
-    # Declare arg/return types for all functions we use (required for correct marshalling)
-    user32.OpenClipboard.argtypes    = [wintypes.HWND]
-    user32.OpenClipboard.restype     = wintypes.BOOL
-    user32.EmptyClipboard.argtypes   = []
-    user32.EmptyClipboard.restype    = wintypes.BOOL
-    user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
-    user32.SetClipboardData.restype  = wintypes.HANDLE
-    user32.CloseClipboard.argtypes   = []
-    user32.CloseClipboard.restype    = wintypes.BOOL
-    kernel32.GlobalAlloc.argtypes    = [wintypes.UINT, ctypes.c_size_t]
-    kernel32.GlobalAlloc.restype     = wintypes.HGLOBAL
-    kernel32.GlobalLock.argtypes     = [wintypes.HGLOBAL]
-    kernel32.GlobalLock.restype      = wintypes.LPVOID
-    kernel32.GlobalUnlock.argtypes   = [wintypes.HGLOBAL]
-    kernel32.GlobalUnlock.restype    = wintypes.BOOL
-    kernel32.GlobalFree.argtypes     = [wintypes.HGLOBAL]
-    kernel32.GlobalFree.restype      = wintypes.HGLOBAL
-
+    """Write Unicode text to the Windows clipboard using pre-declared Win32 APIs."""
     encoded = text.encode("utf-16-le") + b"\x00\x00"  # null-terminate UTF-16LE
 
-    if not user32.OpenClipboard(None):
+    if not _user32.OpenClipboard(None):
         raise OSError("Cannot open clipboard")
 
     h_global = None
     ptr = None
     try:
-        user32.EmptyClipboard()
-        h_global = kernel32.GlobalAlloc(GHND, len(encoded))
+        _user32.EmptyClipboard()
+        h_global = _kernel32.GlobalAlloc(_GHND, len(encoded))
         if not h_global:
             raise OSError("GlobalAlloc failed")
-        ptr = kernel32.GlobalLock(h_global)
+        ptr = _kernel32.GlobalLock(h_global)
         if not ptr:
             raise OSError("GlobalLock failed")
         ctypes.memmove(ptr, encoded, len(encoded))
-        kernel32.GlobalUnlock(h_global)
+        _kernel32.GlobalUnlock(h_global)
         ptr = None
-        if not user32.SetClipboardData(CF_UNICODETEXT, h_global):
+        if not _user32.SetClipboardData(_CF_UNICODETEXT, h_global):
             raise OSError("SetClipboardData failed")
-        h_global = None  # ownership transferred to clipboard; must not free
+        h_global = None  # ownership transferred to clipboard
     finally:
         if ptr:
-            kernel32.GlobalUnlock(h_global)
-        if h_global:  # free only if SetClipboardData never took ownership
-            kernel32.GlobalFree(h_global)
-        user32.CloseClipboard()
+            _kernel32.GlobalUnlock(h_global)
+        if h_global:
+            _kernel32.GlobalFree(h_global)
+        _user32.CloseClipboard()
 
 # ---------------------------------------------------------------------------
 # Screen capture
@@ -558,21 +631,33 @@ def _ocr_huggingface(image_path, api_key):
 def _ollama_wait_until_ready(base_url, model, timeout=180):
     """
     Load the model and wait until Ollama is ready to serve REST requests.
+    Returns True if the model was already loaded (warm), False if it had to be loaded (cold).
 
     Root cause: glm-ocr runs on CPU (~2.1 GiB RAM). While loading, Ollama
-    resets every TCP connection. When we previously used Popen (non-blocking),
-    the CLI runner and the plugin's REST calls competed for the same runner,
-    causing resets even after /api/ps showed the model as loaded.
-
-    Fix: call `ollama run <model>` with empty stdin and BLOCK until it exits.
-    The CLI exits once the model is loaded and ready, then the REST server is
-    free to accept our request. A 2 s grace period follows before returning.
+    resets every TCP connection. The CLI uses internal IPC and survives.
+    We block on `ollama run <model>` with empty stdin; the CLI exits once
+    the model is fully loaded and ready. A 2 s grace period follows.
     """
-    import urllib.request
     import shutil
 
-    ollama_exe = shutil.which("ollama") or "ollama"
+    # Check if already loaded via /api/ps before doing anything
+    ps_url = base_url.rstrip("/") + "/api/ps"
+    model_base = model.split(":")[0]
 
+    def _is_loaded():
+        try:
+            with urllib.request.urlopen(ps_url, timeout=5) as resp:
+                ps_data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            loaded = [m.get("name", "") for m in ps_data.get("models", [])]
+            return any(model_base in name for name in loaded)
+        except Exception:
+            return False
+
+    if _is_loaded():
+        log.debug("Model '%s' already in memory — skipping warm-up.", model)
+        return True  # warm
+
+    ollama_exe = shutil.which("ollama") or "ollama"
     if shutil.which("ollama"):
         try:
             log.debug("Blocking on 'ollama run %s' until model is loaded ...", model)
@@ -586,7 +671,7 @@ def _ollama_wait_until_ready(base_url, model, timeout=180):
             )
             log.debug("'ollama run' exited (code %d); waiting 2 s grace ...", proc.returncode)
             time.sleep(2)
-            return
+            return False  # cold start
         except subprocess.TimeoutExpired:
             log.warning("'ollama run' timed out after %ds; falling back to polling", timeout)
         except Exception as exc:
@@ -595,26 +680,18 @@ def _ollama_wait_until_ready(base_url, model, timeout=180):
         log.warning("'ollama' not found on PATH; falling back to /api/ps polling")
 
     # Fallback: poll /api/ps
-    import urllib.request
-    ps_url = base_url.rstrip("/") + "/api/ps"
     deadline = time.monotonic() + timeout
-    model_base = model.split(":")[0]
     log.debug("Polling /api/ps until '%s' is loaded ...", model_base)
     while time.monotonic() < deadline:
         time.sleep(2)
-        try:
-            with urllib.request.urlopen(ps_url, timeout=5) as resp:
-                ps_data = json.loads(resp.read().decode("utf-8", errors="replace"))
-            loaded = [m.get("name", "") for m in ps_data.get("models", [])]
-            log.debug("Ollama /api/ps loaded: %s", loaded)
-            if any(model_base in name for name in loaded):
-                log.debug("Model '%s' ready (polling fallback).", model)
-                time.sleep(2)
-                return
-        except Exception as exc:
-            log.debug("Polling error: %s", exc)
+        if _is_loaded():
+            log.debug("Model '%s' ready (polling fallback).", model)
+            time.sleep(2)
+            return False  # cold start via fallback
+        log.debug("Ollama /api/ps: model not yet loaded")
 
     log.warning("Timed out waiting for '%s'; attempting OCR anyway", model)
+    return False
 
 
 
@@ -636,14 +713,15 @@ def _ocr_ollama(image_path, base_url=None):
     with open(image_path, "rb") as fh:
         image_b64 = base64.b64encode(fh.read()).decode("utf-8")
 
-    # Step 1: trigger model loading and poll until ready
-    _ollama_wait_until_ready(ollama_url, OCR_MODEL_OLLAMA, timeout=180)
+    # Step 1: trigger model loading and poll until ready.
+    # Returns True if the model was already loaded (no wait needed).
+    already_loaded = _ollama_wait_until_ready(ollama_url, OCR_MODEL_OLLAMA, timeout=180)
 
-    # Give the runner a few extra seconds to finish initialising after appearing
-    # in /api/ps — on CPU-only setups the runner reports ready slightly before
-    # it can actually serve requests with large image payloads.
-    log.debug("Waiting 10 s for runner to fully initialise ...")
-    time.sleep(10)
+    # Give the runner extra time only on a cold start. If the model was already
+    # in memory the runner is immediately ready — no sleep needed.
+    if not already_loaded:
+        log.debug("Cold start detected, waiting 10 s for runner to stabilise ...")
+        time.sleep(10)
 
     # Step 2: real OCR request via urllib (handles large payloads better than
     # http.client with a single socket timeout)
@@ -723,39 +801,76 @@ def _run_detached_ocr_worker(config):
     """
     Full OCR pipeline executed inside the detached child process:
     capture -> OCR -> copy to clipboard -> notify user.
+
+    Guards:
+      - Lock file: only one worker runs at a time. If another is already
+        running, the new request is silently dropped (the user will see the
+        result of the running one shortly).
+      - Duplicate image: if the clipboard contains the same image as the last
+        processed one, the request is skipped to avoid re-running OCR on a
+        stale clipboard.
     """
-    image_path = _capture_screen_region()
-    if not image_path:
-        _notify("Screen OCR", "Capture cancelled: no area selected.", level="warning")
-        return
+    # --- lock: one worker at a time ---
+    if os.path.exists(_LOCK_PATH):
+        try:
+            age = time.time() - os.path.getmtime(_LOCK_PATH)
+        except OSError:
+            age = 0
+        if age < 300:  # stale lock after 5 min
+            log.info("Another worker is already running (lock age %.0fs), exiting.", age)
+            _notify("Screen OCR", "Already processing a request…", level="warning")
+            return
+        log.warning("Stale lock file found (age %.0fs), removing.", age)
+    try:
+        open(_LOCK_PATH, "w").close()
+    except OSError:
+        pass
 
     try:
-        markdown = _ocr_request(
-            image_path=image_path,
-            backend=config.get("backend", BACKEND_OLLAMA),
-            hf_api_key=config.get("hf_api_key", "").strip(),
-            ollama_entrypoint=config.get("ollama_entrypoint", OLLAMA_DEFAULT_URL),
-        )
-    except Exception as exc:
-        log.exception("OCR failed")
-        _notify("Screen OCR - Error", f"OCR failed: {str(exc)[:180]}", level="error")
-        return
+        image_path = _capture_screen_region()
+        if not image_path:
+            _notify("Screen OCR", "Capture cancelled: no area selected.", level="warning")
+            return
+
+        # --- duplicate image guard ---
+        if _is_duplicate_image(image_path):
+            log.info("Image is identical to last processed one, skipping.")
+            _notify("Screen OCR", "Same image as last time — skipped.", level="warning")
+            _try_remove(image_path)
+            return
+
+        _notify("Screen OCR", "Processing… please wait.", level="info")
+
+        try:
+            markdown = _ocr_request(
+                image_path=image_path,
+                backend=config.get("backend", BACKEND_OLLAMA),
+                hf_api_key=config.get("hf_api_key", "").strip(),
+                ollama_entrypoint=config.get("ollama_entrypoint", OLLAMA_DEFAULT_URL),
+            )
+        except Exception as exc:
+            log.exception("OCR failed")
+            _notify("Screen OCR – Error", f"OCR failed: {str(exc)[:180]}", level="error")
+            return
+        finally:
+            _try_remove(image_path)
+
+        text = (markdown or "").strip()
+        if not text:
+            _notify("Screen OCR", "No text detected.", level="warning")
+            return
+
+        try:
+            _copy_text_to_clipboard(markdown)
+        except Exception as exc:
+            log.exception("Clipboard write failed")
+            _notify("Screen OCR – Error", f"Clipboard write failed: {str(exc)[:180]}", level="error")
+            return
+
+        _notify("Screen OCR", f"Done – {len(text)} characters copied to clipboard.")
+
     finally:
-        _try_remove(image_path)
-
-    text = (markdown or "").strip()
-    if not text:
-        _notify("Screen OCR", "No text detected.", level="warning")
-        return
-
-    try:
-        _copy_text_to_clipboard(markdown)
-    except Exception as exc:
-        log.exception("Clipboard write failed")
-        _notify("Screen OCR - Error", f"Clipboard write failed: {str(exc)[:180]}", level="error")
-        return
-
-    _notify("Screen OCR", f"Done: {len(text)} characters copied to clipboard.")
+        _try_remove(_LOCK_PATH)
 
 # ---------------------------------------------------------------------------
 # Worker process lifecycle
