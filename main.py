@@ -555,13 +555,78 @@ def _ocr_huggingface(image_path, api_key):
 # OCR backend – Ollama (local)
 # ---------------------------------------------------------------------------
 
+def _ollama_wait_until_ready(base_url, model, timeout=180):
+    """
+    Load the model and wait until Ollama is ready to serve REST requests.
+
+    Root cause: glm-ocr runs on CPU (~2.1 GiB RAM). While loading, Ollama
+    resets every TCP connection. When we previously used Popen (non-blocking),
+    the CLI runner and the plugin's REST calls competed for the same runner,
+    causing resets even after /api/ps showed the model as loaded.
+
+    Fix: call `ollama run <model>` with empty stdin and BLOCK until it exits.
+    The CLI exits once the model is loaded and ready, then the REST server is
+    free to accept our request. A 2 s grace period follows before returning.
+    """
+    import urllib.request
+    import shutil
+
+    ollama_exe = shutil.which("ollama") or "ollama"
+
+    if shutil.which("ollama"):
+        try:
+            log.debug("Blocking on 'ollama run %s' until model is loaded ...", model)
+            proc = subprocess.run(
+                [ollama_exe, "run", model],
+                input=b"",            # empty stdin → CLI loads model then exits
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=timeout,
+                creationflags=_CREATE_NO_WINDOW,
+            )
+            log.debug("'ollama run' exited (code %d); waiting 2 s grace ...", proc.returncode)
+            time.sleep(2)
+            return
+        except subprocess.TimeoutExpired:
+            log.warning("'ollama run' timed out after %ds; falling back to polling", timeout)
+        except Exception as exc:
+            log.warning("ollama CLI failed (%s); falling back to /api/ps polling", exc)
+    else:
+        log.warning("'ollama' not found on PATH; falling back to /api/ps polling")
+
+    # Fallback: poll /api/ps
+    import urllib.request
+    ps_url = base_url.rstrip("/") + "/api/ps"
+    deadline = time.monotonic() + timeout
+    model_base = model.split(":")[0]
+    log.debug("Polling /api/ps until '%s' is loaded ...", model_base)
+    while time.monotonic() < deadline:
+        time.sleep(2)
+        try:
+            with urllib.request.urlopen(ps_url, timeout=5) as resp:
+                ps_data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            loaded = [m.get("name", "") for m in ps_data.get("models", [])]
+            log.debug("Ollama /api/ps loaded: %s", loaded)
+            if any(model_base in name for name in loaded):
+                log.debug("Model '%s' ready (polling fallback).", model)
+                time.sleep(2)
+                return
+        except Exception as exc:
+            log.debug("Polling error: %s", exc)
+
+    log.warning("Timed out waiting for '%s'; attempting OCR anyway", model)
+
+
+
 def _ocr_ollama(image_path, base_url=None):
     """
     Run OCR via a local Ollama vision model using the REST API (/api/chat).
 
-    Note: the Ollama CLI ('ollama run') is interactive-only and cannot accept
-    image files as arguments in a non-TTY subprocess. The REST API is the
-    correct programmatic interface.
+    glm-ocr runs on CPU (~2.1 GiB RAM). During cold-start Ollama resets every
+    TCP connection while loading the model. We trigger loading via the CLI,
+    poll /api/ps until the model is ready, then send the OCR request.
+    A short retry loop handles the rare race where the model just appeared in
+    /api/ps but the runner isn't fully accepting requests yet.
     """
     ollama_url = (base_url or OLLAMA_DEFAULT_URL or "").strip() or OLLAMA_DEFAULT_URL
 
@@ -571,32 +636,52 @@ def _ocr_ollama(image_path, base_url=None):
     with open(image_path, "rb") as fh:
         image_b64 = base64.b64encode(fh.read()).decode("utf-8")
 
+    # Step 1: trigger model loading and poll until ready
+    _ollama_wait_until_ready(ollama_url, OCR_MODEL_OLLAMA, timeout=180)
+
+    # Give the runner a few extra seconds to finish initialising after appearing
+    # in /api/ps — on CPU-only setups the runner reports ready slightly before
+    # it can actually serve requests with large image payloads.
+    log.debug("Waiting 10 s for runner to fully initialise ...")
+    time.sleep(10)
+
+    # Step 2: real OCR request via urllib (handles large payloads better than
+    # http.client with a single socket timeout)
+    import urllib.request
+    import urllib.error
+
     url = ollama_url.rstrip("/") + "/api/chat"
     body = {
         "model": OCR_MODEL_OLLAMA,
         "stream": False,
         "messages": [{"role": "user", "content": OLLAMA_OCR_PROMPT, "images": [image_b64]}],
     }
+    payload_bytes = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=payload_bytes,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
 
-    try:
-        status_code, response_text, data = _http_post_json(
-            url,
-            headers={},
-            payload=body,
-            timeout=120.0,
-        )
-    except ConnectionError:
+    last_exc = None
+    for attempt in range(1, 5):
+        try:
+            log.debug("OCR attempt %d ...", attempt)
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                response_text = resp.read().decode("utf-8", errors="replace")
+            data = json.loads(response_text)
+            break
+        except Exception as exc:
+            last_exc = exc
+            log.warning("OCR attempt %d failed, retrying in 5s: %s", attempt, exc)
+            time.sleep(5)
+    else:
         raise RuntimeError(
-            f"Cannot connect to Ollama at {ollama_url}. "
-            "Make sure the Ollama service is running."
+            f"Ollama failed after 4 attempts. Last error: {last_exc}"
         )
 
-    log.debug("Ollama HTTP %s", status_code)
-    if status_code != 200:
-        raise RuntimeError(
-            f"Ollama returned HTTP {status_code}: {response_text.strip()[:220]}"
-        )
-
+    log.debug("Ollama response received (%d bytes)", len(response_text))
     if not isinstance(data, dict):
         raise RuntimeError(
             f"Invalid JSON from Ollama: {response_text.strip()[:220]}"
@@ -605,6 +690,7 @@ def _ocr_ollama(image_path, base_url=None):
     # Fallback to "response" key used by older Ollama versions.
     content = data.get("message", {}).get("content") or data.get("response") or ""
     return content.strip()
+
 
 # ---------------------------------------------------------------------------
 # OCR dispatcher
