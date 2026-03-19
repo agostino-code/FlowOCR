@@ -15,10 +15,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v2
-      - name: Set up Python ${{ env.python_ver }}
+      - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v2
         with:
-          python-version: ${{ env.python_ver }}
+          python-version: ${{ matrix.python-versions }}
       - name: get version
         id: version
         uses: notiz-dev/github-action-json-property@release
@@ -30,12 +30,12 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r ./requirements.txt -t ./lib
-          zip -r Flow.Launcher.Plugin.DeepSeekOCR.zip . -x '*.git*'
+          zip -r Flow.Launcher.Plugin.FlowOCR.zip . -x '*.git*'
       - name: Publish
         if: success()
         uses: softprops/action-gh-release@v1
         with:
-          files: 'Flow.Launcher.Plugin.DeepSeekOCR.zip'
+          files: 'Flow.Launcher.Plugin.FlowOCR.zip'
           tag_name: "v${{steps.version.outputs.prop}}"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
