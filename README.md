@@ -53,7 +53,7 @@ Create a free account at [huggingface.co](https://huggingface.co), then generate
 
 1. Download or clone this repository into your Flow Launcher plugins folder:
    ```
-   %APPDATA%\FlowLauncher\Plugins\DeepSeekOCR-1.0.0\
+   %APPDATA%\FlowLauncher\Plugins\FlowOCR-1.0.0\
    ```
 2. Restart Flow Launcher (or reload plugins via `fl settings`).
 3. Dependencies are installed automatically on first run.
