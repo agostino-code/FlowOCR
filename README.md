@@ -93,7 +93,7 @@ Each run writes a timestamped log to `%TEMP%\YYYYMMDD_HHMMSS.log`. Check the mos
 ## Project structure
 
 ```
-DeepSeekOCR-1.0.0/
+FlowOCR-1.0.0/
 ├── main.py                # Plugin logic
 ├── plugin.json            # Flow Launcher plugin manifest
 ├── requirements.txt       # Python dependencies
