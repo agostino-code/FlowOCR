@@ -352,10 +352,18 @@ def _is_duplicate_image(path):
 
 def _clear_clipboard():
     """Clear the Windows clipboard (removes any existing image before snipping)."""
-    _run_powershell(
+    result = _run_powershell(
         "Add-Type -AssemblyName System.Windows.Forms;"
-        "[Windows.Forms.Clipboard]::Clear();"
+        "try {"
+        "  [Windows.Forms.Clipboard]::Clear();"
+        "  exit 0;"
+        "} catch {"
+        "  Write-Error $_;"
+        "  exit 1;"
+        "}"
     )
+    if result and result.returncode != 0:
+        log.warning("Failed to clear clipboard (returncode=%d)", result.returncode)
 
 
 def _clipboard_image_to_temp_png():
@@ -373,14 +381,23 @@ def _clipboard_image_to_temp_png():
     result = _run_powershell(
         "Add-Type -AssemblyName System.Windows.Forms;"
         "Add-Type -AssemblyName System.Drawing;"
-        "$img = [Windows.Forms.Clipboard]::GetImage();"
-        "if ($img -eq $null) { exit 2 };"
-        "$ms = New-Object System.IO.MemoryStream;"
-        "try { $img.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png) }"
-        "catch { Write-Error $_; exit 6 };"
-        "$b64 = [Convert]::ToBase64String($ms.ToArray());"
-        "Write-Output $b64;"
-        "try { $ms.Dispose(); $img.Dispose() } catch { };",
+        "try {"
+        "  $img = [Windows.Forms.Clipboard]::GetImage();"
+        "  if ($img -eq $null) { exit 2 };"
+        "  $ms = New-Object System.IO.MemoryStream;"
+        "  try {"
+        "    $img.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png);"
+        "    $b64 = [Convert]::ToBase64String($ms.ToArray());"
+        "    Write-Output $b64;"
+        "  } finally {"
+        "    try { $ms.Dispose() } catch { };"
+        "    try { $img.Dispose() } catch { };"
+        "  }"
+        "  exit 0;"
+        "} catch {"
+        "  Write-Error $_;"
+        "  exit 6;"
+        "}",
         timeout=15,
     )
 
@@ -395,7 +412,7 @@ def _clipboard_image_to_temp_png():
         _try_remove(tmp.name)
         return None
     if rc == 6:
-        log.error("PowerShell: Save() to MemoryStream failed")
+        log.error("PowerShell: Failed to process clipboard image")
         _try_remove(tmp.name)
         return None
     if rc != 0:
@@ -462,6 +479,7 @@ def _capture_screen_region(timeout_seconds=60):
     Returns the path to a temporary PNG file, or None on timeout/cancel.
     """
     _clear_clipboard()
+    time.sleep(0.1)  # Small delay to ensure clipboard is fully cleared
     try:
         os.startfile("ms-screenclip:")
     except OSError as exc:
@@ -602,11 +620,13 @@ def _ocr_huggingface(image_path, api_key):
     headers = {"Authorization": f"Bearer {api_key}"}
 
     log.debug("HF POST JSON: image %d bytes as data URI", len(raw_bytes))
+
+    # Use shorter timeout for initial request to fail fast on auth errors
     status_code, body, resp_payload = _http_post_json(
         HF_ROUTER_URL,
         headers=headers,
         payload=payload,
-        timeout=90.0,
+        timeout=30.0,  # Reduced from 90 to 30 seconds for faster failure
     )
     log.debug("HF response: HTTP %s, body=%s", status_code, body[:200])
 
@@ -614,6 +634,11 @@ def _ocr_huggingface(image_path, api_key):
         raise RuntimeError(
             "HuggingFace authentication failed (401). "
             "Check hf_api_key / HF_TOKEN and token permissions."
+        )
+    if status_code == 403:
+        raise RuntimeError(
+            "HuggingFace authorization failed (403). "
+            "Your token may not have access to this model."
         )
     if status_code >= 400 or _hf_has_error(resp_payload):
         raise RuntimeError(f"HF router error: {_hf_error_message(resp_payload, body)}")
@@ -653,9 +678,24 @@ def _ollama_wait_until_ready(base_url, model, timeout=180):
         except Exception:
             return False
 
+    def _is_ollama_running():
+        """Quick check if Ollama server is responding at all."""
+        try:
+            with urllib.request.urlopen(base_url.rstrip("/") + "/api/tags", timeout=3) as resp:
+                return resp.status == 200
+        except Exception:
+            return False
+
     if _is_loaded():
         log.debug("Model '%s' already in memory — skipping warm-up.", model)
         return True  # warm
+
+    # Check if Ollama is even running before attempting to load the model
+    if not _is_ollama_running():
+        raise RuntimeError(
+            "Ollama server is not running. "
+            "Start it with 'ollama serve' or check your ollama_entrypoint setting."
+        )
 
     ollama_exe = shutil.which("ollama") or "ollama"
     if shutil.which("ollama"):
@@ -679,8 +719,8 @@ def _ollama_wait_until_ready(base_url, model, timeout=180):
     else:
         log.warning("'ollama' not found on PATH; falling back to /api/ps polling")
 
-    # Fallback: poll /api/ps
-    deadline = time.monotonic() + timeout
+    # Fallback: poll /api/ps with shorter timeout
+    deadline = time.monotonic() + min(timeout, 60)  # Cap polling at 60 seconds
     log.debug("Polling /api/ps until '%s' is loaded ...", model_base)
     while time.monotonic() < deadline:
         time.sleep(2)
@@ -690,8 +730,10 @@ def _ollama_wait_until_ready(base_url, model, timeout=180):
             return False  # cold start via fallback
         log.debug("Ollama /api/ps: model not yet loaded")
 
-    log.warning("Timed out waiting for '%s'; attempting OCR anyway", model)
-    return False
+    raise RuntimeError(
+        f"Timed out waiting for Ollama model '{model}' to load. "
+        "Ensure Ollama is running and the model is available."
+    )
 
 
 
@@ -746,18 +788,23 @@ def _ocr_ollama(image_path, base_url=None):
     for attempt in range(1, 5):
         try:
             log.debug("OCR attempt %d ...", attempt)
-            with urllib.request.urlopen(req, timeout=300) as resp:
+            with urllib.request.urlopen(req, timeout=60) as resp:  # Reduced from 300 to 60 seconds
                 response_text = resp.read().decode("utf-8", errors="replace")
             data = json.loads(response_text)
             break
+        except urllib.error.URLError as exc:
+            last_exc = exc
+            log.warning("OCR attempt %d failed (connection error), retrying in 5s: %s", attempt, exc)
+            time.sleep(5)
         except Exception as exc:
             last_exc = exc
             log.warning("OCR attempt %d failed, retrying in 5s: %s", attempt, exc)
             time.sleep(5)
     else:
-        raise RuntimeError(
-            f"Ollama failed after 4 attempts. Last error: {last_exc}"
-        )
+        error_msg = f"Ollama failed after 4 attempts"
+        if last_exc:
+            error_msg += f". Last error: {last_exc}"
+        raise RuntimeError(error_msg)
 
     log.debug("Ollama response received (%d bytes)", len(response_text))
     if not isinstance(data, dict):
