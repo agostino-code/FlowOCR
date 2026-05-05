@@ -106,4 +106,4 @@ FlowOCR-1.0.0/
 
 ## License
 
-MIT
+GPL (General Public License)
