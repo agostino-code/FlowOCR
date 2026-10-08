@@ -118,6 +118,6 @@ FlowOCR-1.0.0/
 ```
 
 ## Version Management
-- Version defined in `plugin.json` (currently 1.0.2)
+- Version defined in `plugin.json` (currently 1.0.4)
 - Update version number when making breaking changes or significant features
 - Git commit messages should describe the change (e.g., "Enhance OCR functionality with duplicate image check")

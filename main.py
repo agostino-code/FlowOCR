@@ -19,10 +19,13 @@ import http.client
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import urllib.error
 import urllib.request
 from ctypes import wintypes
 from urllib.parse import urlsplit
@@ -43,7 +46,7 @@ from pyflowlauncher import Plugin  # noqa: E402
 # ---------------------------------------------------------------------------
 _LOG_PATH = os.path.join(
     tempfile.gettempdir(),
-    datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + ".log",
+    "flowocr_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + ".log",
 )
 logging.basicConfig(
     filename=_LOG_PATH,
@@ -91,8 +94,12 @@ _LAST_IMAGE_HASH_PATH = os.path.join(tempfile.gettempdir(), "screen-ocr-last-has
 def _purge_old_logs():
     tmp = tempfile.gettempdir()
     cutoff = time.time() - 2 * 86400
-    for name in os.listdir(tmp):
-        if name.endswith(".log") and name[:8].isdigit():
+    try:
+        entries = os.listdir(tmp)
+    except OSError:
+        return
+    for name in entries:
+        if name.startswith("flowocr_") and name.endswith(".log"):
             path = os.path.join(tmp, name)
             try:
                 if os.path.getmtime(path) < cutoff:
@@ -177,27 +184,6 @@ def _http_post_json(url, headers, payload, timeout):
     return _http_post_bytes(url, final_headers, data, timeout)
 
 
-def _http_post_multipart(url, headers, field_name, file_name, file_bytes, file_mime, timeout):
-    """POST multipart/form-data with one file field and return HTTP tuple."""
-    boundary = "----FlowOCRBoundary" + os.urandom(12).hex()
-    boundary_bytes = boundary.encode("ascii")
-
-    body = bytearray()
-    body.extend(b"--" + boundary_bytes + b"\r\n")
-    disposition = (
-        f'Content-Disposition: form-data; name="{field_name}"; filename="{file_name}"\r\n'
-    )
-    body.extend(disposition.encode("utf-8"))
-    body.extend(f"Content-Type: {file_mime}\r\n\r\n".encode("ascii"))
-    body.extend(file_bytes)
-    body.extend(b"\r\n--" + boundary_bytes + b"--\r\n")
-
-    final_headers = {
-        **(headers or {}),
-        "Content-Type": f"multipart/form-data; boundary={boundary}",
-    }
-    return _http_post_bytes(url, final_headers, bytes(body), timeout)
-
 # ---------------------------------------------------------------------------
 # PowerShell helpers
 # ---------------------------------------------------------------------------
@@ -225,11 +211,6 @@ def _run_powershell(script, *args, timeout=10):
     except (OSError, subprocess.TimeoutExpired) as exc:
         log.warning("PowerShell failed: %s", exc)
         return None
-
-
-def _ps_quote(value):
-    """Escape a value for use inside a PowerShell single-quoted string."""
-    return str(value).replace("'", "''")
 
 # ---------------------------------------------------------------------------
 # Windows notifications – pure ctypes, no PowerShell round-trip
@@ -265,62 +246,103 @@ class _NOTIFYICONDATAW(ctypes.Structure):
         ("dwInfoFlags",      wintypes.DWORD),
     ]
 
-def _notify(title, message, level="info"):
-    """Show a Windows tray balloon notification using Shell_NotifyIconW (no PowerShell)."""
+def _notify(title, message, level="info", block=False):
+    """
+    Show a Windows tray balloon notification using Shell_NotifyIconW.
+    If block is False, runs in a background daemon thread so OCR inference isn't delayed.
+    If block is True, waits up to 2 seconds for the balloon to display before returning.
+    """
     log.info("Notify [%s] %s – %s", level, title, message)
 
-    niif = {
-        "error":   _NIIF_ERROR,
-        "warning": _NIIF_WARNING,
-    }.get(level, _NIIF_INFO)
+    def _worker():
+        try:
+            niif = {
+                "error":   _NIIF_ERROR,
+                "warning": _NIIF_WARNING,
+            }.get(level, _NIIF_INFO)
 
-    # Load a stock icon matching the level
-    _IDI = {"error": 32513, "warning": 32515}.get(level, 32516)  # IDI_ERROR/WARNING/INFO
-    shell32  = ctypes.windll.shell32
-    user32   = ctypes.windll.user32
-    hIcon = user32.LoadIconW(None, ctypes.c_int(_IDI))
+            # Load a stock icon matching the level
+            _IDI = {"error": 32513, "warning": 32515}.get(level, 32516)  # IDI_ERROR/WARNING/INFO
+            shell32  = ctypes.windll.shell32
+            user32   = ctypes.windll.user32
+            hIcon = user32.LoadIconW(None, ctypes.c_int(_IDI))
 
-    nid = _NOTIFYICONDATAW()
-    nid.cbSize      = ctypes.sizeof(_NOTIFYICONDATAW)
-    nid.hWnd        = user32.GetDesktopWindow()
-    nid.uID         = 0xF10C  # arbitrary unique ID for this plugin
-    nid.uFlags      = _NIF_ICON | _NIF_TIP | _NIF_INFO
-    nid.hIcon       = hIcon
-    nid.szTip       = "Screen OCR"[:127]
-    nid.szInfoTitle = title[:63]
-    nid.szInfo      = message[:255]
-    nid.dwInfoFlags = niif
+            nid = _NOTIFYICONDATAW()
+            nid.cbSize      = ctypes.sizeof(_NOTIFYICONDATAW)
+            nid.hWnd        = user32.GetDesktopWindow()
+            nid.uID         = 0xF10C  # arbitrary unique ID for this plugin
+            nid.uFlags      = _NIF_ICON | _NIF_TIP | _NIF_INFO
+            nid.hIcon       = hIcon
+            nid.szTip       = "Screen OCR"[:127]
+            nid.szInfoTitle = title[:63]
+            nid.szInfo      = message[:255]
+            nid.dwInfoFlags = niif
 
-    shell32.Shell_NotifyIconW(_NIM_ADD,    ctypes.byref(nid))
-    time.sleep(4)
-    shell32.Shell_NotifyIconW(_NIM_DELETE, ctypes.byref(nid))
+            shell32.Shell_NotifyIconW(_NIM_ADD,    ctypes.byref(nid))
+            time.sleep(3)
+            shell32.Shell_NotifyIconW(_NIM_DELETE, ctypes.byref(nid))
+        except Exception as exc:
+            log.warning("Notification failed: %s", exc)
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    if block:
+        t.join(timeout=2.0)
 
 
 # ---------------------------------------------------------------------------
-# Clipboard – ctypes declarations at module level (avoids re-declaring per call)
+# Clipboard & Win32 – ctypes declarations at module level (avoids re-declaring per call)
 # ---------------------------------------------------------------------------
 _user32   = ctypes.WinDLL("user32",   use_last_error=True)
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
+_CF_BITMAP      = 2
+_CF_DIB         = 8
 _CF_UNICODETEXT = 13
+_CF_DIBV5       = 17
 _GHND           = 0x0042
 
-_user32.OpenClipboard.argtypes    = [wintypes.HWND]
-_user32.OpenClipboard.restype     = wintypes.BOOL
-_user32.EmptyClipboard.argtypes   = []
-_user32.EmptyClipboard.restype    = wintypes.BOOL
-_user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
-_user32.SetClipboardData.restype  = wintypes.HANDLE
-_user32.CloseClipboard.argtypes   = []
-_user32.CloseClipboard.restype    = wintypes.BOOL
-_kernel32.GlobalAlloc.argtypes    = [wintypes.UINT, ctypes.c_size_t]
-_kernel32.GlobalAlloc.restype     = wintypes.HGLOBAL
-_kernel32.GlobalLock.argtypes     = [wintypes.HGLOBAL]
-_kernel32.GlobalLock.restype      = wintypes.LPVOID
-_kernel32.GlobalUnlock.argtypes   = [wintypes.HGLOBAL]
-_kernel32.GlobalUnlock.restype    = wintypes.BOOL
-_kernel32.GlobalFree.argtypes     = [wintypes.HGLOBAL]
-_kernel32.GlobalFree.restype      = wintypes.HGLOBAL
+_user32.OpenClipboard.argtypes              = [wintypes.HWND]
+_user32.OpenClipboard.restype               = wintypes.BOOL
+_user32.EmptyClipboard.argtypes             = []
+_user32.EmptyClipboard.restype              = wintypes.BOOL
+_user32.IsClipboardFormatAvailable.argtypes = [wintypes.UINT]
+_user32.IsClipboardFormatAvailable.restype  = wintypes.BOOL
+_user32.SetClipboardData.argtypes           = [wintypes.UINT, wintypes.HANDLE]
+_user32.SetClipboardData.restype            = wintypes.HANDLE
+_user32.CloseClipboard.argtypes             = []
+_user32.CloseClipboard.restype              = wintypes.BOOL
+_kernel32.GlobalAlloc.argtypes              = [wintypes.UINT, ctypes.c_size_t]
+_kernel32.GlobalAlloc.restype               = wintypes.HGLOBAL
+_kernel32.GlobalLock.argtypes               = [wintypes.HGLOBAL]
+_kernel32.GlobalLock.restype                = wintypes.LPVOID
+_kernel32.GlobalUnlock.argtypes             = [wintypes.HGLOBAL]
+_kernel32.GlobalUnlock.restype              = wintypes.BOOL
+_kernel32.GlobalFree.argtypes               = [wintypes.HGLOBAL]
+_kernel32.GlobalFree.restype                = wintypes.HGLOBAL
+
+_kernel32.OpenProcess.argtypes              = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+_kernel32.OpenProcess.restype               = wintypes.HANDLE
+_kernel32.GetExitCodeProcess.argtypes       = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+_kernel32.GetExitCodeProcess.restype        = wintypes.BOOL
+_kernel32.CloseHandle.argtypes              = [wintypes.HANDLE]
+_kernel32.CloseHandle.restype               = wintypes.BOOL
+
+
+def _is_pid_running(pid):
+    """Check if a process with given PID is currently active on Windows."""
+    if pid <= 0:
+        return False
+    handle = _kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return False
+    try:
+        exit_code = wintypes.DWORD()
+        if _kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return exit_code.value == 259  # 259 is STILL_ACTIVE
+        return True
+    finally:
+        _kernel32.CloseHandle(handle)
 
 
 def _image_hash(path):
@@ -349,21 +371,26 @@ def _is_duplicate_image(path):
     return False
 
 
-
 def _clear_clipboard():
-    """Clear the Windows clipboard (removes any existing image before snipping)."""
-    result = _run_powershell(
-        "Add-Type -AssemblyName System.Windows.Forms;"
-        "try {"
-        "  [Windows.Forms.Clipboard]::Clear();"
-        "  exit 0;"
-        "} catch {"
-        "  Write-Error $_;"
-        "  exit 1;"
-        "}"
+    """Clear the Windows clipboard using native Win32 APIs (no PowerShell overhead)."""
+    for _ in range(5):
+        if _user32.OpenClipboard(None):
+            try:
+                _user32.EmptyClipboard()
+                return
+            finally:
+                _user32.CloseClipboard()
+        time.sleep(0.02)
+    log.warning("Failed to open clipboard to clear it.")
+
+
+def _has_clipboard_image():
+    """Fast check whether clipboard contains bitmap data before launching PowerShell."""
+    return bool(
+        _user32.IsClipboardFormatAvailable(_CF_DIB)
+        or _user32.IsClipboardFormatAvailable(_CF_BITMAP)
+        or _user32.IsClipboardFormatAvailable(_CF_DIBV5)
     )
-    if result and result.returncode != 0:
-        log.warning("Failed to clear clipboard (returncode=%d)", result.returncode)
 
 
 def _clipboard_image_to_temp_png():
@@ -475,11 +502,12 @@ def _capture_screen_region(timeout_seconds=60):
     Open the Windows Snipping Tool (ms-screenclip:) and wait for the user to
     select a region. The tool places the result on the clipboard automatically.
 
-    Polls the clipboard with exponential back-off to minimise CPU usage.
+    Fast Win32 clipboard format polling is used before invoking PowerShell
+    to extract the PNG, saving CPU and eliminating process-spawn lag.
     Returns the path to a temporary PNG file, or None on timeout/cancel.
     """
     _clear_clipboard()
-    time.sleep(0.1)  # Small delay to ensure clipboard is fully cleared
+    time.sleep(0.05)
     try:
         os.startfile("ms-screenclip:")
     except OSError as exc:
@@ -488,15 +516,16 @@ def _capture_screen_region(timeout_seconds=60):
 
     deadline   = time.monotonic() + timeout_seconds
     sleep_time = 0.05   # start fast, ramp up
-    max_sleep  = 0.5
+    max_sleep  = 0.3
 
     while time.monotonic() < deadline:
-        image_path = _clipboard_image_to_temp_png()
-        if image_path:
-            log.info("Screen capture ready: %s", image_path)
-            return image_path
+        if _has_clipboard_image():
+            image_path = _clipboard_image_to_temp_png()
+            if image_path:
+                log.info("Screen capture ready: %s", image_path)
+                return image_path
         time.sleep(sleep_time)
-        sleep_time = min(sleep_time * 1.3, max_sleep)
+        sleep_time = min(sleep_time * 1.2, max_sleep)
 
     log.warning("Clipboard wait timed out after %.1f s", timeout_seconds)
     return None
@@ -663,8 +692,6 @@ def _ollama_wait_until_ready(base_url, model, timeout=180):
     We block on `ollama run <model>` with empty stdin; the CLI exits once
     the model is fully loaded and ready. A 2 s grace period follows.
     """
-    import shutil
-
     # Check if already loaded via /api/ps before doing anything
     ps_url = base_url.rstrip("/") + "/api/ps"
     model_base = model.split(":")[0]
@@ -767,9 +794,6 @@ def _ocr_ollama(image_path, base_url=None):
 
     # Step 2: real OCR request via urllib (handles large payloads better than
     # http.client with a single socket timeout)
-    import urllib.request
-    import urllib.error
-
     url = ollama_url.rstrip("/") + "/api/chat"
     body = {
         "model": OCR_MODEL_OLLAMA,
@@ -850,43 +874,58 @@ def _run_detached_ocr_worker(config):
     capture -> OCR -> copy to clipboard -> notify user.
 
     Guards:
-      - Lock file: only one worker runs at a time. If another is already
-        running, the new request is silently dropped (the user will see the
-        result of the running one shortly).
+      - Lock file with PID check: only one worker runs at a time. If another is
+        actively running, the new request is ignored. If a previous worker died,
+        the lock is cleared immediately without waiting 5 minutes.
       - Duplicate image: if the clipboard contains the same image as the last
         processed one, the request is skipped to avoid re-running OCR on a
         stale clipboard.
     """
-    # --- lock: one worker at a time ---
+    # --- lock: one worker at a time with PID check ---
     if os.path.exists(_LOCK_PATH):
+        locked_pid = None
+        try:
+            with open(_LOCK_PATH, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+            locked_pid = int(content) if content.isdigit() else None
+        except Exception:
+            locked_pid = None
+
         try:
             age = time.time() - os.path.getmtime(_LOCK_PATH)
         except OSError:
             age = 0
-        if age < 300:  # stale lock after 5 min
-            log.info("Another worker is already running (lock age %.0fs), exiting.", age)
-            _notify("Screen OCR", "Already processing a request…", level="warning")
-            return
-        log.warning("Stale lock file found (age %.0fs), removing.", age)
+
+        if locked_pid and _is_pid_running(locked_pid):
+            if age < 300:
+                log.info("Worker PID %d is still running (lock age %.0fs), exiting.", locked_pid, age)
+                _notify("Screen OCR", "Already processing a request…", level="warning", block=True)
+                return
+            log.warning("Worker PID %d exceeded 300s, assuming stale.", locked_pid)
+        else:
+            log.info("Previous worker PID %s is not active (lock age %.0fs), overriding lock.", locked_pid, age)
+
     try:
-        open(_LOCK_PATH, "w").close()
+        with open(_LOCK_PATH, "w", encoding="utf-8") as f:
+            f.write(str(os.getpid()))
     except OSError:
         pass
 
     try:
         image_path = _capture_screen_region()
         if not image_path:
-            _notify("Screen OCR", "Capture cancelled: no area selected.", level="warning")
+            _notify("Screen OCR", "Capture cancelled: no area selected.", level="warning", block=True)
             return
 
         # --- duplicate image guard ---
         if _is_duplicate_image(image_path):
             log.info("Image is identical to last processed one, skipping.")
-            _notify("Screen OCR", "Same image as last time — skipped.", level="warning")
+            _notify("Screen OCR", "Same image as last time — skipped.", level="warning", block=True)
             _try_remove(image_path)
             return
 
-        _notify("Screen OCR", "Processing… please wait.", level="info")
+        # Non-blocking notification so OCR request starts immediately
+        _notify("Screen OCR", "Processing… please wait.", level="info", block=False)
 
         try:
             markdown = _ocr_request(
@@ -897,24 +936,24 @@ def _run_detached_ocr_worker(config):
             )
         except Exception as exc:
             log.exception("OCR failed")
-            _notify("Screen OCR – Error", f"OCR failed: {str(exc)[:180]}", level="error")
+            _notify("Screen OCR – Error", f"OCR failed: {str(exc)[:180]}", level="error", block=True)
             return
         finally:
             _try_remove(image_path)
 
         text = (markdown or "").strip()
         if not text:
-            _notify("Screen OCR", "No text detected.", level="warning")
+            _notify("Screen OCR", "No text detected.", level="warning", block=True)
             return
 
         try:
             _copy_text_to_clipboard(markdown)
         except Exception as exc:
             log.exception("Clipboard write failed")
-            _notify("Screen OCR – Error", f"Clipboard write failed: {str(exc)[:180]}", level="error")
+            _notify("Screen OCR – Error", f"Clipboard write failed: {str(exc)[:180]}", level="error", block=True)
             return
 
-        _notify("Screen OCR", f"Done – {len(text)} characters copied to clipboard.")
+        _notify("Screen OCR", f"Done – {len(text)} characters copied to clipboard.", block=True)
 
     finally:
         _try_remove(_LOCK_PATH)

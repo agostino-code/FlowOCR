@@ -13,32 +13,35 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    env:
-      python_ver: 3.11
 
     steps:
-      - uses: actions/checkout@v2
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v2
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-versions }}
-      - name: get version
+          python-version: "3.11"
+
+      - name: Get version
         id: version
         uses: notiz-dev/github-action-json-property@release
         with: 
           path: 'plugin.json'
           prop_path: 'Version'
-      - run: echo ${{steps.version.outputs.prop}} 
-      - name: Install dependencies
+
+      - run: echo ${{ steps.version.outputs.prop }}
+
+      - name: Install dependencies & package
         run: |
           python -m pip install --upgrade pip
           pip install -r ./requirements.txt -t ./lib
-          zip -r Flow.Launcher.Plugin.FlowOCR.zip . -x '*.git*'
-      - name: Publish
+          zip -r Flow.Launcher.Plugin.FlowOCR.zip . -x '*.git*' -x '.github/*' -x '.venv/*' -x 'CLAUDE.md'
+
+      - name: Publish Release
         if: success()
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           files: 'Flow.Launcher.Plugin.FlowOCR.zip'
-          tag_name: "v${{steps.version.outputs.prop}}"
+          tag_name: "v${{ steps.version.outputs.prop }}"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
